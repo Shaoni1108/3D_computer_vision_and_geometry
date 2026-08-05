@@ -35,18 +35,99 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-REPO_PROJECT_DIR = PROJECT_DIR.parent
-EXPERIMENTS_DIR = PROJECT_DIR / "experiments"
-if str(EXPERIMENTS_DIR) not in sys.path:
-    sys.path.insert(0, str(EXPERIMENTS_DIR))
+PROJECT_DIR = Path(__file__).resolve().parent
+LEGACY_EXPERIMENTS_DIR = PROJECT_DIR / "experiments"
+if LEGACY_EXPERIMENTS_DIR.exists() and str(LEGACY_EXPERIMENTS_DIR) not in sys.path:
+    sys.path.insert(0, str(LEGACY_EXPERIMENTS_DIR))
 
-from deep_learning_utils.metrics import binary_classification_metrics  # noqa: E402
-from deep_learning_utils.splits import stratified_indices  # noqa: E402
+try:
+    from deep_learning_utils.metrics import binary_classification_metrics  # type: ignore  # noqa: E402
+    from deep_learning_utils.splits import stratified_indices  # type: ignore  # noqa: E402
+except ModuleNotFoundError:
+
+    def _auc_score(y_true: list[int], y_score: list[float]) -> float:
+        positives = [score for label, score in zip(y_true, y_score) if label == 1]
+        negatives = [score for label, score in zip(y_true, y_score) if label == 0]
+        if not positives or not negatives:
+            return float("nan")
+
+        wins = 0.0
+        for pos_score in positives:
+            for neg_score in negatives:
+                if pos_score > neg_score:
+                    wins += 1.0
+                elif pos_score == neg_score:
+                    wins += 0.5
+        return wins / (len(positives) * len(negatives))
+
+    def _average_precision(y_true: list[int], y_score: list[float]) -> float:
+        total_positive = sum(y_true)
+        if total_positive == 0:
+            return float("nan")
+
+        ranked = sorted(zip(y_score, y_true), reverse=True)
+        true_positive = 0
+        precision_sum = 0.0
+        for rank, (_, label) in enumerate(ranked, start=1):
+            if label == 1:
+                true_positive += 1
+                precision_sum += true_positive / rank
+        return precision_sum / total_positive
+
+    def binary_classification_metrics(y_true: list[int], y_score: list[float]) -> dict[str, float]:
+        y_pred = [int(score >= 0.5) for score in y_score]
+        tp = sum(1 for truth, pred in zip(y_true, y_pred) if truth == 1 and pred == 1)
+        tn = sum(1 for truth, pred in zip(y_true, y_pred) if truth == 0 and pred == 0)
+        fp = sum(1 for truth, pred in zip(y_true, y_pred) if truth == 0 and pred == 1)
+        fn = sum(1 for truth, pred in zip(y_true, y_pred) if truth == 1 and pred == 0)
+
+        accuracy = (tp + tn) / max(1, len(y_true))
+        precision = tp / max(1, tp + fp)
+        recall = tp / max(1, tp + fn)
+        specificity = tn / max(1, tn + fp)
+        f1 = 2.0 * precision * recall / max(1e-12, precision + recall)
+        return {
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "specificity": specificity,
+            "f1": f1,
+            "balanced_accuracy": (recall + specificity) / 2.0,
+            "roc_auc": _auc_score(y_true, y_score),
+            "pr_auc": _average_precision(y_true, y_score),
+        }
+
+    def stratified_indices(
+        labels: list[int],
+        test_size: float,
+        val_size: float,
+        seed: int,
+    ) -> tuple[list[int], list[int], list[int]]:
+        rng = random.Random(seed)
+        by_label: dict[int, list[int]] = {}
+        for index, label in enumerate(labels):
+            by_label.setdefault(int(label), []).append(index)
+
+        train_idx: list[int] = []
+        val_idx: list[int] = []
+        test_idx: list[int] = []
+        for indices in by_label.values():
+            rng.shuffle(indices)
+            n_total = len(indices)
+            n_test = max(1, round(n_total * test_size))
+            n_val = max(1, round(n_total * val_size))
+            test_idx.extend(indices[:n_test])
+            val_idx.extend(indices[n_test : n_test + n_val])
+            train_idx.extend(indices[n_test + n_val :])
+
+        rng.shuffle(train_idx)
+        rng.shuffle(val_idx)
+        rng.shuffle(test_idx)
+        return train_idx, val_idx, test_idx
 
 
-DEFAULT_DATA = REPO_PROJECT_DIR / "multimodal_datapipeline" / "data" / "processed" / "chembl_molecule_curated.csv"
-DEFAULT_OUT_DIR = PROJECT_DIR / "experiments" / "experiment_4_molecule_3d_pointcloud"
+DEFAULT_DATA = PROJECT_DIR / "chembl_molecule_curated.csv"
+DEFAULT_OUT_DIR = PROJECT_DIR
 
 
 def parse_float(value: str | None) -> float | None:
@@ -346,7 +427,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> tupl
 def write_report(path: Path, metrics: dict[str, object]) -> None:
     test = metrics["test"]
     lines = [
-        "# Experiment 4 Comparison Report",
+        "# Comparison Report",
         "",
         "## Question",
         "",
@@ -583,7 +664,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_arg_parser().parse_args()
     metrics = train(args)
-    print("Experiment 4 complete")
+    print("Experiment complete")
     print("Course topic: Unit III - 3D Point Cloud")
     print(f"Rows: {metrics['n_rows']}")
     print(f"Conformer failures: {metrics['n_conformer_failures']}")
